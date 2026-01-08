@@ -113,7 +113,7 @@ docker run -d --name neo4j \
 ```env
 # LLM配置
 LLM_API_BASE=http://localhost:8000/v1
-LLM_MODEL_NAME=Qwen/Qwen2.5-8B-Instruct
+LLM_MODEL_NAME=Qwen/Qwen3-8B-Instruct【自行替换自己部署的模型】
 
 # Milvus配置
 MILVUS_HOST=localhost
