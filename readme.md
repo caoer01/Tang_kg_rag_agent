@@ -74,14 +74,14 @@ pdf的文档我是直接在网上找的论文。
 
 ```bash
 # 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+conda create -n your_env_name python=3.12
+conda activate your_env_name
 
 # 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 服务部署
+### 2. 服务部署[可以去docker hub上拉取]
 
 #### Milvus (向量数据库)
 ```bash
@@ -288,49 +288,6 @@ print(f"质量评分: {response['quality_score']}")
 └── requirements.txt           # 依赖
 ```
 
-## 扩展建议
-
-### 1. 实体链接优化
-- 引入医学实体词典
-- 实体消歧（如"糖尿病" → 1型/2型）
-
-### 2. 图谱查询优化
-- 增加路径排序算法
-- 支持模糊匹配
-
-### 3. 检索增强
-- 添加Dense Passage Retrieval
-- 实现查询扩展
-
-### 4. 用户画像
-- 记录用户糖尿病类型
-- 个性化推荐
-
-### 5. 多轮对话
-- 上下文理解
-- 追问澄清
-
-## 常见问题
-
-### Q1: Milvus连接失败？
-检查Milvus服务是否启动：
-```bash
-docker ps | grep milvus
-```
-
-### Q2: Neo4j查询超时？
-增加查询超时时间，或优化Cypher查询添加LIMIT。
-
-### Q3: LLM响应慢？
-- 调整`LLM_MAX_TOKENS`减少生成长度
-- 使用量化模型
-- 增加vllm GPU资源
-
-### Q4: 内存占用过高？
-- 减少`CHUNK_SIZE`
-- 降低`TOP_K`
-- 分批处理文档
-
 ## 性能指标
 
 | 指标 | 目标值 |
@@ -341,4 +298,5 @@ docker ps | grep milvus
 | 首次成功率 | > 80% |
 
 
-**注意**: 本系统仅供参考，不能替代专业医疗建议。用户应咨询医生获取专业诊疗意见。
+**注意**: 该项目主要用于大模型应用开发学习。本系统仅供参考，不能替代专业医疗建议，用户应咨询医生获取专业诊疗意见。同时，也不要拿此项目用作任何商业行为！！！【包括去咸鱼、小红书等平台卖！！！】
+
