@@ -1,474 +1,314 @@
-"""知识图谱查询模块 - 高级查询功能"""
-from typing import List, Dict, Any, Optional, Tuple
+"""检索结果重排序模块"""
+from typing import List, Dict, Any
 import logging
-from src.knowledge_graph.neo4j_client import neo4j_client
 from src.llm.qwen_client import llm_client
-from config.prompts import CYPHER_GENERATION_PROMPT
 
 logger = logging.getLogger(__name__)
 
 
-class GraphQueryEngine:
-    """图谱查询引擎"""
+class Reranker:
+    """检索结果重排序器"""
 
     def __init__(self):
-        """初始化查询引擎"""
-        self.max_path_length = 5  # 最大路径长度
-        self.max_results = 50  # 最大返回结果数
+        """初始化重排序器"""
+        self.rerank_methods = ["llm", "cross_encoder", "bm25_boost"]
 
-    def query_by_entities(
+    def rerank(
             self,
-            entities: List[str],
-            max_hops: int = 2
-    ) -> Dict[str, Any]:
-        """根据实体查询相关子图
-
-        Args:
-            entities: 实体名称列表
-            max_hops: 最大跳数
-
-        Returns:
-            查询结果
-        """
-        if not entities:
-            return {"nodes": [], "relationships": [], "summary": ""}
-
-        try:
-            # 查询子图
-            subgraph = neo4j_client.get_subgraph(
-                entity_names=entities,
-                max_depth=max_hops
-            )
-
-            # 生成总结
-            summary = self._summarize_subgraph(entities, subgraph)
-
-            return {
-                "nodes": subgraph.get("nodes", []),
-                "relationships": subgraph.get("relationships", []),
-                "summary": summary,
-                "entity_count": len(subgraph.get("nodes", [])),
-                "relation_count": len(subgraph.get("relationships", []))
-            }
-
-        except Exception as e:
-            logger.error(f"实体查询失败: {e}")
-            return {"nodes": [], "relationships": [], "summary": "查询失败"}
-
-    def query_shortest_path(
-            self,
-            source: str,
-            target: str,
-            relation_types: Optional[List[str]] = None
-    ) -> List[Dict[str, Any]]:
-        """查询两个实体间的最短路径
-
-        Args:
-            source: 源实体名称
-            target: 目标实体名称
-            relation_types: 关系类型限制
-
-        Returns:
-            路径列表
-        """
-        try:
-            # 构建Cypher查询
-            if relation_types:
-                rel_filter = "|".join(relation_types)
-                rel_pattern = f"[r:{rel_filter}]"
-            else:
-                rel_pattern = "[r]"
-
-            cypher = f"""
-            MATCH (source {{name: $source}}), (target {{name: $target}})
-            MATCH path = shortestPath((source)-{rel_pattern}*..{self.max_path_length}-(target))
-            RETURN 
-                [node in nodes(path) | node.name] as node_names,
-                [node in nodes(path) | labels(node)[0]] as node_types,
-                [rel in relationships(path) | type(rel)] as relation_types,
-                length(path) as path_length
-            LIMIT 5
-            """
-
-            results = neo4j_client.execute_query(cypher, {
-                "source": source,
-                "target": target
-            })
-
-            return results
-
-        except Exception as e:
-            logger.error(f"最短路径查询失败: {e}")
-            return []
-
-    def query_multi_hop_relations(
-            self,
-            entity: str,
-            hops: int = 2,
-            direction: str = "both"
-    ) -> List[Dict[str, Any]]:
-        """查询多跳关系
-
-        Args:
-            entity: 实体名称
-            hops: 跳数
-            direction: 方向 ("outgoing", "incoming", "both")
-
-        Returns:
-            关系路径列表
-        """
-        try:
-            results = neo4j_client.get_entity_relations(
-                entity_name=entity,
-                direction=direction,
-                max_depth=hops
-            )
-
-            # 按路径长度排序
-            results.sort(key=lambda x: x.get("path_length", 0))
-
-            return results[:self.max_results]
-
-        except Exception as e:
-            logger.error(f"多跳关系查询失败: {e}")
-            return []
-
-    def query_by_pattern(
-            self,
-            pattern: str,
-            parameters: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """使用自定义模式查询
-
-        Args:
-            pattern: Cypher模式
-            parameters: 查询参数
-
-        Returns:
-            查询结果
-        """
-        try:
-            return neo4j_client.execute_query(pattern, parameters)
-        except Exception as e:
-            logger.error(f"模式查询失败: {e}")
-            return []
-
-    def query_neighborhood(
-            self,
-            entity: str,
-            radius: int = 1,
-            node_limit: int = 20
-    ) -> Dict[str, Any]:
-        """查询实体的邻域
-
-        Args:
-            entity: 实体名称
-            radius: 邻域半径
-            node_limit: 节点数量限制
-
-        Returns:
-            邻域子图
-        """
-        try:
-            cypher = f"""
-            MATCH path = (center {{name: $entity}})-[*1..{radius}]-(neighbor)
-            WITH center, neighbor, path
-            LIMIT {node_limit}
-            RETURN 
-                collect(DISTINCT neighbor {{.*, id: id(neighbor)}}) as neighbors,
-                collect(DISTINCT {{
-                    source: startNode(relationships(path)[0]).name,
-                    target: endNode(relationships(path)[0]).name,
-                    type: type(relationships(path)[0])
-                }}) as relationships
-            """
-
-            results = neo4j_client.execute_query(cypher, {"entity": entity})
-
-            if results:
-                return {
-                    "center": entity,
-                    "neighbors": results[0].get("neighbors", []),
-                    "relationships": results[0].get("relationships", [])
-                }
-
-            return {"center": entity, "neighbors": [], "relationships": []}
-
-        except Exception as e:
-            logger.error(f"邻域查询失败: {e}")
-            return {"center": entity, "neighbors": [], "relationships": []}
-
-    def query_similar_entities(
-            self,
-            entity: str,
-            entity_type: Optional[str] = None,
+            query: str,
+            documents: List[Dict[str, Any]],
+            method: str = "llm",
             top_k: int = 5
     ) -> List[Dict[str, Any]]:
-        """查询相似实体（基于结构相似性）
+        """重排序文档
 
         Args:
-            entity: 实体名称
-            entity_type: 实体类型
+            query: 查询文本
+            documents: 文档列表
+            method: 重排序方法
             top_k: 返回top-k
 
         Returns:
-            相似实体列表
+            重排序后的文档列表
         """
-        try:
-            # 获取目标实体的邻居
-            target_neighbors = self._get_neighbors(entity)
-
-            # 查找有相似邻居的实体
-            type_filter = f":{entity_type}" if entity_type else ""
-
-            cypher = f"""
-            MATCH (target {{name: $entity}})
-            MATCH (target)-[]-(neighbor)
-            MATCH (similar{type_filter})-[]-(neighbor)
-            WHERE similar.name <> $entity
-            WITH similar, count(DISTINCT neighbor) as common_neighbors
-            ORDER BY common_neighbors DESC
-            LIMIT {top_k}
-            RETURN 
-                similar.name as name,
-                labels(similar)[0] as type,
-                common_neighbors
-            """
-
-            results = neo4j_client.execute_query(cypher, {"entity": entity})
-            return results
-
-        except Exception as e:
-            logger.error(f"相似实体查询失败: {e}")
+        if not documents:
             return []
 
-    def _get_neighbors(self, entity: str) -> List[str]:
-        """获取实体的直接邻居
+        if method == "llm":
+            return self._rerank_with_llm(query, documents, top_k)
+        elif method == "cross_encoder":
+            return self._rerank_with_cross_encoder(query, documents, top_k)
+        elif method == "bm25_boost":
+            return self._rerank_with_bm25_boost(query, documents, top_k)
+        else:
+            logger.warning(f"未知的重排序方法: {method}")
+            return documents[:top_k]
 
-        Args:
-            entity: 实体名称
-
-        Returns:
-            邻居名称列表
-        """
-        cypher = """
-        MATCH (e {name: $entity})-[]-(neighbor)
-        RETURN DISTINCT neighbor.name as name
-        """
-
-        results = neo4j_client.execute_query(cypher, {"entity": entity})
-        return [r["name"] for r in results]
-
-    def aggregate_query(
+    def _rerank_with_llm(
             self,
-            entity_type: str,
-            aggregation: str = "count",
-            group_by: Optional[str] = None
+            query: str,
+            documents: List[Dict[str, Any]],
+            top_k: int
     ) -> List[Dict[str, Any]]:
-        """聚合查询
+        """使用LLM进行重排序
 
         Args:
-            entity_type: 实体类型
-            aggregation: 聚合函数 ("count", "sum", "avg")
-            group_by: 分组字段
+            query: 查询文本
+            documents: 文档列表
+            top_k: 返回数量
 
         Returns:
-            聚合结果
+            重排序后的文档
         """
         try:
-            if group_by:
-                cypher = f"""
-                MATCH (n:{entity_type})
-                RETURN n.{group_by} as group_key, count(n) as count
-                ORDER BY count DESC
-                """
-            else:
-                cypher = f"""
-                MATCH (n:{entity_type})
-                RETURN count(n) as total
-                """
+            # 限制输入LLM的文档数量
+            docs_to_rank = documents[:min(len(documents), 10)]
 
-            return neo4j_client.execute_query(cypher)
+            # 构建prompt
+            prompt = f"""请对以下检索结果按照与问题的相关性进行评分（0-1分）。
 
-        except Exception as e:
-            logger.error(f"聚合查询失败: {e}")
-            return []
+问题: {query}
 
-    def query_relation_chain(
-            self,
-            start_entity: str,
-            relation_chain: List[str]
-    ) -> List[Dict[str, Any]]:
-        """查询特定关系链
+检索结果:
+"""
+            for i, doc in enumerate(docs_to_rank, 1):
+                text = doc.get("text", "")[:200]  # 截断过长文本
+                prompt += f"\n{i}. {text}..."
 
-        Args:
-            start_entity: 起始实体
-            relation_chain: 关系类型链，如 ["CAUSES", "HAS_SYMPTOM"]
+            prompt += "\n\n请以JSON格式返回每条结果的评分，例如: {\"scores\": [0.9, 0.7, 0.5, ...]}"
 
-        Returns:
-            路径结果
-        """
-        try:
-            # 构建关系链模式
-            patterns = []
-            for i, rel_type in enumerate(relation_chain):
-                patterns.append(f"-[r{i}:{rel_type}]->")
-
-            pattern_str = "".join(patterns)
-
-            cypher = f"""
-            MATCH path = (start {{name: $entity}}){pattern_str}(end)
-            RETURN 
-                [node in nodes(path) | {{name: node.name, type: labels(node)[0]}}] as nodes,
-                [rel in relationships(path) | type(rel)] as relations
-            LIMIT 20
-            """
-
-            return neo4j_client.execute_query(cypher, {"entity": start_entity})
-
-        except Exception as e:
-            logger.error(f"关系链查询失败: {e}")
-            return []
-
-    def generate_cypher_from_nl(
-            self,
-            question: str,
-            entities: List[str]
-    ) -> Tuple[str, str]:
-        """从自然语言生成Cypher查询
-
-        Args:
-            question: 自然语言问题
-            entities: 识别的实体
-
-        Returns:
-            (cypher查询, 解释)
-        """
-        try:
-            prompt = CYPHER_GENERATION_PROMPT.format(
-                entities=entities,
-                question=question
-            )
-
+            # 调用LLM
             result = llm_client.generate_json(prompt)
+            scores = result.get("scores", [])
 
-            cypher = result.get("cypher", "")
-            explanation = result.get("explanation", "")
+            # 应用评分
+            for i, score in enumerate(scores[:len(docs_to_rank)]):
+                docs_to_rank[i]["rerank_score"] = float(score)
 
-            # 验证Cypher语法
-            if cypher and self._validate_cypher(cypher):
-                return cypher, explanation
-            else:
-                logger.warning("生成的Cypher无效")
-                return "", "Cypher生成失败"
+            # 排序
+            ranked = sorted(
+                docs_to_rank,
+                key=lambda x: x.get("rerank_score", 0),
+                reverse=True
+            )
+
+            return ranked[:top_k]
 
         except Exception as e:
-            logger.error(f"Cypher生成失败: {e}")
-            return "", str(e)
+            logger.error(f"LLM重排序失败: {e}")
+            return documents[:top_k]
 
-    def _validate_cypher(self, cypher: str) -> bool:
-        """验证Cypher查询语法
-
-        Args:
-            cypher: Cypher查询
-
-        Returns:
-            是否有效
-        """
-        # 基本语法检查
-        required_keywords = ["MATCH", "RETURN"]
-        cypher_upper = cypher.upper()
-
-        for keyword in required_keywords:
-            if keyword not in cypher_upper:
-                return False
-
-        # 检查是否有危险操作
-        dangerous_keywords = ["DELETE", "DROP", "CREATE INDEX", "DETACH DELETE"]
-        for keyword in dangerous_keywords:
-            if keyword in cypher_upper:
-                logger.warning(f"检测到危险操作: {keyword}")
-                return False
-
-        return True
-
-    def _summarize_subgraph(
+    def _rerank_with_cross_encoder(
             self,
-            entities: List[str],
-            subgraph: Dict[str, Any]
-    ) -> str:
-        """总结子图结果
+            query: str,
+            documents: List[Dict[str, Any]],
+            top_k: int
+    ) -> List[Dict[str, Any]]:
+        """使用Cross-Encoder模型重排序
 
         Args:
-            entities: 查询的实体
-            subgraph: 子图数据
+            query: 查询文本
+            documents: 文档列表
+            top_k: 返回数量
 
         Returns:
-            总结文本
+            重排序后的文档
         """
-        nodes = subgraph.get("nodes", [])
-        relationships = subgraph.get("relationships", [])
+        try:
+            # 这里可以集成CrossEncoder模型
+            # from sentence_transformers import CrossEncoder
+            # model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-        if not nodes:
-            return f"未找到关于 {', '.join(entities)} 的相关信息。"
+            # 由于没有安装CrossEncoder，这里使用简化版本
+            logger.warning("CrossEncoder未实现，使用原始评分")
 
-        # 统计节点类型
+            # 简单地使用原始分数
+            scored_docs = documents[:min(len(documents), 20)]
+
+            # 这里应该计算query和每个doc的cross-encoder分数
+            # 现在只是保持原有分数
+            for doc in scored_docs:
+                if "rerank_score" not in doc:
+                    doc["rerank_score"] = doc.get("score", 0)
+
+            ranked = sorted(
+                scored_docs,
+                key=lambda x: x.get("rerank_score", 0),
+                reverse=True
+            )
+
+            return ranked[:top_k]
+
+        except Exception as e:
+            logger.error(f"CrossEncoder重排序失败: {e}")
+            return documents[:top_k]
+
+    def _rerank_with_bm25_boost(
+            self,
+            query: str,
+            documents: List[Dict[str, Any]],
+            top_k: int
+    ) -> List[Dict[str, Any]]:
+        """使用BM25提升重排序
+
+        Args:
+            query: 查询文本
+            documents: 文档列表
+            top_k: 返回数量
+
+        Returns:
+            重排序后的文档
+        """
+        import jieba
         from collections import Counter
-        node_types = Counter(node.get("type") for node in nodes)
-        rel_types = Counter(rel.get("type") for rel in relationships)
 
-        summary_parts = [
-            f"查询 {', '.join(entities)} 相关信息:",
-            f"找到 {len(nodes)} 个相关实体",
-        ]
+        # 查询词频
+        query_tokens = list(jieba.cut(query))
+        query_counter = Counter(query_tokens)
 
-        # 添加类型分布
-        if node_types:
-            type_str = ", ".join(
-                f"{count}个{type_}"
-                for type_, count in node_types.most_common(3)
-            )
-            summary_parts.append(f"包括: {type_str}")
+        # 计算每个文档的BM25提升分数
+        for doc in documents:
+            text = doc.get("text", "")
+            doc_tokens = list(jieba.cut(text))
+            doc_counter = Counter(doc_tokens)
 
-        # 添加关系信息
-        if rel_types:
-            rel_str = ", ".join(
-                f"{count}个{type_}"
-                for type_, count in rel_types.most_common(3)
-            )
-            summary_parts.append(f"关系类型: {rel_str}")
+            # 计算词重叠
+            overlap_score = sum(
+                min(query_counter[term], doc_counter[term])
+                for term in query_counter
+            ) / max(len(query_tokens), 1)
 
-        return "。".join(summary_parts) + "。"
+            # 结合原始分数
+            original_score = doc.get("score", 0)
+            doc["rerank_score"] = 0.7 * original_score + 0.3 * overlap_score
 
-    def explain_query_result(
+        # 排序
+        ranked = sorted(
+            documents,
+            key=lambda x: x.get("rerank_score", 0),
+            reverse=True
+        )
+
+        return ranked[:top_k]
+
+    def diversified_rerank(
             self,
-            question: str,
-            result: Dict[str, Any]
-    ) -> str:
-        """解释查询结果
+            query: str,
+            documents: List[Dict[str, Any]],
+            top_k: int = 5,
+            diversity_weight: float = 0.3
+    ) -> List[Dict[str, Any]]:
+        """多样性重排序（MMR算法）
 
         Args:
-            question: 原始问题
-            result: 查询结果
+            query: 查询文本
+            documents: 文档列表
+            top_k: 返回数量
+            diversity_weight: 多样性权重（0-1）
 
         Returns:
-            自然语言解释
+            多样化后的文档列表
         """
-        from config.prompts import GRAPH_SUMMARY_PROMPT
+        if not documents or len(documents) <= top_k:
+            return documents
+
+        from src.vector_store.embeddings import embedding_model
+        import numpy as np
 
         try:
-            prompt = GRAPH_SUMMARY_PROMPT.format(
-                question=question,
-                graph_results=result
-            )
+            # 向量化
+            query_vec = embedding_model.embed_query(query)
+            doc_texts = [d.get("text", "") for d in documents]
+            doc_vecs = embedding_model.embed_texts(doc_texts)
 
-            explanation = llm_client.generate(prompt)
-            return explanation
+            # 计算相似度
+            def cosine_sim(a, b):
+                return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+            query_sims = [cosine_sim(query_vec, doc_vec) for doc_vec in doc_vecs]
+
+            # MMR选择
+            selected_indices = []
+            remaining_indices = list(range(len(documents)))
+
+            # 选择第一个（最相关的）
+            best_idx = max(remaining_indices, key=lambda i: query_sims[i])
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+
+            # 迭代选择
+            while len(selected_indices) < top_k and remaining_indices:
+                mmr_scores = []
+
+                for idx in remaining_indices:
+                    # 相关性分数
+                    relevance = query_sims[idx]
+
+                    # 多样性分数（与已选文档的最大相似度）
+                    max_sim = max(
+                        cosine_sim(doc_vecs[idx], doc_vecs[sel_idx])
+                        for sel_idx in selected_indices
+                    )
+
+                    # MMR分数
+                    mmr = (1 - diversity_weight) * relevance - diversity_weight * max_sim
+                    mmr_scores.append((idx, mmr))
+
+                # 选择MMR分数最高的
+                best_idx = max(mmr_scores, key=lambda x: x[1])[0]
+                selected_indices.append(best_idx)
+                remaining_indices.remove(best_idx)
+
+            # 返回选中的文档
+            return [documents[i] for i in selected_indices]
 
         except Exception as e:
-            logger.error(f"结果解释失败: {e}")
-            return result.get("summary", "")
+            logger.error(f"多样性重排序失败: {e}")
+            return documents[:top_k]
+
+    def explain_ranking(
+            self,
+            query: str,
+            document: Dict[str, Any]
+    ) -> str:
+        """解释为什么文档被排在当前位置
+
+        Args:
+            query: 查询文本
+            document: 文档
+
+        Returns:
+            解释文本
+        """
+        explanation_parts = []
+
+        # 原始分数
+        if "score" in document:
+            explanation_parts.append(
+                f"原始检索分数: {document['score']:.3f}"
+            )
+
+        # 重排序分数
+        if "rerank_score" in document:
+            explanation_parts.append(
+                f"重排序分数: {document['rerank_score']:.3f}"
+            )
+
+        # 来源
+        if "source" in document:
+            explanation_parts.append(
+                f"来源: {document['source']}"
+            )
+
+        # 元数据
+        metadata = document.get("metadata", {})
+        if "source" in metadata:
+            explanation_parts.append(
+                f"文档: {metadata['source']}"
+            )
+
+        return " | ".join(explanation_parts)
 
 
 # 全局实例
-graph_query_engine = GraphQueryEngine()
+reranker = Reranker()
